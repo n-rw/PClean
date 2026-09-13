@@ -112,6 +112,9 @@ class Rejuvenator:
         self.obj_obs: Dict[tuple, Dict[VertexID, Any]] = {}
         # (cls, oid) -> objects holding a slot pointing at it.
         self.referrers: Dict[tuple, set] = {}
+        # Joint settings scored across all blocked updates -- the cost subproblem hints
+        # are there to reduce.
+        self.scored = 0
 
         obs_cls = model.observation_class
         for row, omap, root_oid in zip(rows, smc.owner_maps, smc.row_assignments):
@@ -154,38 +157,16 @@ class Rejuvenator:
             total += node.dist.logdensity(val, *args)
         return total
 
-    def sweep(self, verbose: bool = False) -> int:
-        changed = 0
-        for cname in reversed(self.model.topological_class_order()):
-            cls = self.model.classes[cname]
-            for oid, obj in list(self.trace.table(cname).objects.items()):
-                for v in range(len(cls.nodes)):
-                    node = strip_submodel(cls.nodes[v])
-                    if not isinstance(node, RandomChoiceNode):
-                        continue
-                    if v in cls.hash_keys or "." in cls.node_name(v):
-                        continue      # guaranteed fields are trusted; flattened copies
-                                      # belong to another object, not this one
-                    if not node.dist.has_discrete_proposal():
-                        continue
-                    if self._update(cls, cname, obj, v, node, verbose):
-                        changed += 1
-        return changed
-
     def _transitive_referrers(self, cname, oid) -> set:
         """Every object that transitively points at this one.
 
         One hop is not enough. In the hospital model the evidence about a City's clean
-        name is the dirty `obs_city` spelling on the **Records** -- but a City's direct
-        referrers are Practices, which observe nothing. Stop at one hop and the city has
-        no evidence at all, every candidate scores identically on the prior, and
-        rejuvenation quietly does nothing while looking like it ran.
+        name is the dirty spelling on the **Records** -- but a City's direct referrers are
+        Practices, which observe nothing. Stop at one hop and the city has no evidence,
+        every candidate scores the same on the prior, and rejuvenation quietly does
+        nothing while appearing to run.
 
-        Counting stays per *object*: each Record contributes its own `obs_city` once,
-        because that attribute really is one draw per record. Where the error model sits
-        on the entity instead (the Figure 1 / Physicians shape), the referrers are the
-        entities and each contributes once. The rule is the same either way -- score every
-        object that owns a relevant observation, exactly once.
+        Counting stays per *object*: each object contributes its own observations once.
         """
         seen, frontier = set(), [(cname, oid)]
         while frontier:
@@ -196,47 +177,114 @@ class Rejuvenator:
                     frontier.append(r)
         return seen
 
-    def _update(self, cls, cname, obj, v, node, verbose) -> bool:
-        """Re-draw one attribute from its full conditional.
+    def sweep(self, verbose: bool = False) -> int:
+        """One pass over every object, re-enumerating each of its subproblems.
 
-        The conditional needs this object's own observed cells plus those of every object
-        holding a slot pointing at it -- a Practice's dirty `bad_city` depends on its
-        City's clean `name`. Each is scored exactly once.
-
-        NOTE (divergence): the Julia erases precisely the affected slice of the database
-        (`R_minus_r`, [App. D.1]) and recomputes only the terms that changed. We recompute
-        the local scores of the object and its direct referrers; untouched terms are
-        constant across candidates and cancel in the normalisation.
+        Reverse topological order, so a Record's City is settled before the Record is
+        revisited [App. D.1].
         """
-        pr = FlatProposer(self.model, self.trace)
-        args = pr._args(cls, node, obj.values)
-        if args is None:
-            return False
-        options, priors = node.dist.discrete_proposal(*args)
-        if len(options) <= 1:
-            return False
+        changed = 0
+        for cname in reversed(self.model.topological_class_order()):
+            cls = self.model.classes[cname]
+            for oid, obj in list(self.trace.table(cname).objects.items()):
+                for block in cls.blocks:
+                    changed += self._update_block(cls, cname, obj, block, verbose)
+        return changed
 
-        refs = self._transitive_referrers(cname, obj.oid)
-        old = obj.values.get(v)
-        scores, vals = [], []
-        for opt, lp in zip(options, priors):
+    def _targets(self, cls, cname, obj, block) -> List[VertexID]:
+        """Which vertices of this block are actually free to move."""
+        obs = self.obj_obs.get((cname, obj.oid), {})
+        out = []
+        for v in block:
+            node = strip_submodel(cls.nodes[v])
+            if not isinstance(node, RandomChoiceNode):
+                continue
+            if v in cls.hash_keys or "." in cls.node_name(v) or v in obs:
+                continue      # trusted key / owned by another object / directly observed
+            if not node.dist.has_discrete_proposal():
+                continue
+            out.append(v)
+        return out
+
+    def _settings(self, cls, obj, targets, i, cur, lp, out):
+        """Enumerate every joint setting of a block's free vertices, with its log prior.
+
+        Recursion in topological order, so each vertex's arguments are resolved against
+        the partial setting chosen so far -- which is what makes `specialty ~ ...(degree)`
+        work: specialty's candidate list is asked for *given* the degree under test.
+
+        This is the combinatorial term subproblem hints control. k dependent vertices with
+        n candidates each cost n**k settings in one block, and n*k across k blocks.
+        """
+        if i == len(targets):
+            out.append((dict(cur), lp))
+            return
+        v = targets[i]
+        node = strip_submodel(cls.nodes[v])
+        obj.values.update(cur)
+        args = FlatProposer(self.model, self.trace)._args(cls, node, obj.values)
+        if args is None:
+            self._settings(cls, obj, targets, i + 1, cur, lp, out)
+            return
+        options, priors = node.dist.discrete_proposal(*args)
+        for opt, p in zip(options, priors):
             if opt is DUMMY:
                 opt = node.dist.discrete_proposal_dummy_value(*args)
-            obj.values[v] = opt
+            cur[v] = opt
+            self._settings(cls, obj, targets, i + 1, cur, lp + p, out)
+        cur.pop(v, None)
+
+    def _update_block(self, cls, cname, obj, block, verbose) -> int:
+        """Blocked Gibbs: re-draw a whole subproblem at once, from its full conditional.
+
+        **Blocked, not single-site.** Updating one variable at a time gets stuck, because
+        a city's clean name and the spellings that depend on it are tightly correlated and
+        no single-variable move can escape a bad mode. Redrawing an entire subproblem
+        together can [App. D.1].
+
+        The conditional needs this object's own observed cells plus those of every object
+        that transitively points at it, each counted **once**.
+
+        NOTE (divergence): the Julia scores incrementally, exploiting the Plan forest so
+        that conditionally independent vertices add rather than multiply, and erasing only
+        the affected slice of the database (`R_minus_r`). We enumerate complete settings
+        and rescore the object and its referrers for each. Same distribution -- shared
+        terms are constant across settings and cancel in the normalisation -- but we do
+        not get the forest's savings on this path, only on the SMC path in proposal.py.
+        """
+        targets = self._targets(cls, cname, obj, block)
+        if not targets:
+            return 0
+
+        settings = []
+        old = {v: obj.values.get(v) for v in targets}
+        self._settings(cls, obj, targets, 0, {}, 0.0, settings)
+        obj.values.update(old)
+        if len(settings) <= 1:
+            return 0
+
+        refs = self._transitive_referrers(cname, obj.oid)
+        scores = []
+        for vals, lp in settings:
+            obj.values.update(vals)
             s = lp + self._score_local(cls, cname, obj)
             for (rc, ro) in refs:
                 robj = self.trace.table(rc).objects.get(ro)
                 if robj is not None:
                     s += self._score_local(self.model.classes[rc], rc, robj)
             scores.append(s)
-            vals.append(opt)
+        self.scored += len(settings)
+        obj.values.update(old)
 
-        obj.values[v] = old
         marginal = logsumexp(scores)
         if marginal == -math.inf:
-            return False
-        i = _sample(scores, marginal)
-        obj.values[v] = vals[i]
-        if verbose and vals[i] != old:
-            print(f"    rejuv {cname}#{obj.oid}.{cls.node_name(v)}: {old!r} -> {vals[i]!r}")
-        return vals[i] != old
+            return 0
+        chosen, _ = settings[_sample(scores, marginal)]
+        obj.values.update(chosen)
+        n = sum(1 for v in targets if chosen.get(v) != old.get(v))
+        if verbose and n:
+            for v in targets:
+                if chosen.get(v) != old.get(v):
+                    print(f"    rejuv {cname}#{obj.oid}.{cls.node_name(v)}: "
+                          f"{old.get(v)!r} -> {chosen.get(v)!r}")
+        return n

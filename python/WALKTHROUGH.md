@@ -155,6 +155,35 @@ loop, and the accuracy climbing 55% → 69.5% across rounds is that loop tighten
 
 ---
 
+## 7. Carving the work up
+
+**Read:** `minipclean/builder.py` → `subproblem()`, then `proposal.propose` and
+`smc.Rejuvenator._update_block`
+
+`subproblem begin ... end` partitions a class's variables into ordered blocks, and SMC
+treats each as an intermediate target: enumerate jointly, commit, move on [§3.3]. Two
+dependent variables with 15 and 50 candidates cost 15x50 in one block and 15+50 in two —
+at the price of choosing the first without knowing the second.
+
+Run it:
+
+```
+$ python3 python/example_subproblems.py
+cost     : 11.5x fewer settings scored (177,645 vs 2,049,750), 3.8x faster
+accuracy : 36.3% vs 37.0% (mean of 3 seeds, +0.7 points)
+```
+
+Note also that rejuvenation is **blocked** Gibbs — a whole subproblem redrawn at once, not
+one variable at a time. The paper is explicit that single-site moves get stuck.
+
+> **Question:** The hints made inference an order of magnitude cheaper and changed the
+> answer by less than a point. If they are nearly free, why does the paper call them a
+> *trade* at all — and what would a model have to look like for the joint enumeration to
+> be worth its cost? (Hint: what does rejuvenation cost per sweep, and what happens when
+> the two variables are strongly coupled *through the data* rather than the prior?)
+
+---
+
 ## Where this translation is weaker than the Julia
 
 Stated plainly so you don't mistake a simplification for the design:
@@ -163,8 +192,9 @@ Stated plainly so you don't mistake a simplification for the design:
 |---|---|---|
 | Proposals | generated + JIT-compiled, memoized | interpreted, ~50× slower |
 | Cross-class deps | flattened into one Bayes net | **flattened too** — `builder.reference()` |
-| Subproblem blocking `[§3.3]` | user-declared, splits SMC steps | one block per class |
+| Subproblem blocking `[§3.3]` | user-declared, splits SMC steps | **implemented** — `builder.subproblem()` |
 | Parameters | incremental sufficient statistics | full recount each round |
+| Rejuvenation scoring | incremental, exploits the Plan forest | blocked, but rescores whole settings |
 | Particle cloning | persistent structure, O(1) | deep copy, O(database) |
 | Continuous variables `[App. D.2]` | Particle Gibbs rejuvenation | prior sampling only |
 | Garbage collection | unreferenced objects deleted | not implemented |

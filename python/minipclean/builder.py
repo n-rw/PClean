@@ -19,12 +19,14 @@ argument is a literal, a vertex id (use `cls.ref("other_attr")`), or a
 `(slot_vertex, "attr_name")` pair reaching across a reference slot.
 """
 
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from .distributions import IndexedParameter
 from .model import (ForeignKeyNode, JuliaNode, ParameterNode, ParamLookup,
                     PCleanClass, PCleanModel, PitmanYorParams, RandomChoiceNode,
-                    Ref, SubmodelNode, Via, make_plan, shift_node)
+                    Ref, SubmodelNode, Via, make_plan, shift_node,
+                    strip_submodel)
 
 
 class ClassBuilder:
@@ -37,6 +39,10 @@ class ClassBuilder:
         model.classes[name] = self.cls
         model.class_order.append(name)
         self._by_name: Dict[str, int] = self.cls.names
+        # Subproblem tracking, mirroring `block_status` in builder.jl. `_open` means the
+        # current block is still accepting statements.
+        self._blocks: List[List[int]] = []
+        self._open = False
 
     # -- lookups ----------------------------------------------------------------
 
@@ -59,6 +65,45 @@ class ClassBuilder:
                            f"available: {sorted(k for k in self._by_name if '.' in k)}")
         return Ref(self._by_name[key])
 
+    # -- subproblems [§3.3] -----------------------------------------------------
+
+    def begin_block(self) -> None:
+        """`subproblem begin` — start a new subproblem. Mirrors `begin_block!`."""
+        self._blocks.append([])
+        self._open = True
+
+    def end_block(self) -> None:
+        """`end` — close the current subproblem. Mirrors `end_block!`."""
+        self._open = False
+
+    @contextmanager
+    def subproblem(self):
+        """`subproblem begin ... end` as a `with` block.
+
+        Everything declared inside becomes one subproblem: SMC proposes it as a single
+        joint enumeration, then commits, before moving to the next. See the module
+        docstring in proposal.py for what that buys and what it costs.
+        """
+        self.begin_block()
+        try:
+            yield self
+        finally:
+            self.end_block()
+
+    def _place(self, *vertices: int) -> None:
+        """Put vertices in the current subproblem.
+
+        The default matters and is easy to miss: statements that are *not* wrapped in an
+        explicit subproblem still group together. Closing a block and then declaring
+        something opens a fresh block which stays open, so a run of contiguous statements
+        forms one subproblem rather than one each. (The Julia made this the default in
+        commit "Treat contiguous statements as belonging to the same subproblem".)
+        """
+        if not self._open:
+            self._blocks.append([])
+            self._open = True
+        self._blocks[-1].extend(vertices)
+
     # -- declarations -----------------------------------------------------------
 
     def attribute(self, name: str, dist, args: Optional[List[Any]] = None) -> int:
@@ -77,6 +122,7 @@ class ClassBuilder:
         v = self.cls.add_node(RandomChoiceNode(dist=dist, arg_node_ids=args, name=name),
                               parents)
         self._by_name[name] = v
+        self._place(v)
         return v
 
     def reference(self, name: str, target_class: str) -> int:
@@ -114,6 +160,7 @@ class ClassBuilder:
         target = self.model.classes[target_class]
 
         v = self.cls.add_node(ForeignKeyNode(target_class=target_class, name=name), [])
+        absorbed: List[int] = []
         offset = v + 1
         fk = self.cls.nodes[v]
         fk.vmap = {i: i + offset for i in range(len(target.nodes))}
@@ -133,7 +180,15 @@ class ClassBuilder:
             parents = [v] + [p + offset for p in target.parents(i)]
             w = self.cls.add_node(sub, parents)
             self._by_name[f"{name}.{target.node_name(i)}"] = w
+            absorbed.append(w)
 
+        # The slot and everything it dragged in go into the current subproblem together.
+        # NOTE (divergence from nothing -- the Julia does this too): the target class's
+        # own block structure is *flattened away* here. `add_foreign_key!` concatenates
+        # all of the target's blocks into one list and appends it to the current block.
+        # So subproblem boundaries are a property of the class you are declaring, not
+        # something inherited through a reference.
+        self._place(v, *absorbed)
         self._by_name[name] = v
         return v
 
@@ -142,6 +197,7 @@ class ClassBuilder:
         parents = [a.v for a in args if isinstance(a, Ref)]
         v = self.cls.add_node(JuliaNode(f=f, arg_node_ids=args, name=name), parents)
         self._by_name[name] = v
+        self._place(v)
         return v
 
     def learned(self, name: str, param) -> int:
@@ -179,20 +235,24 @@ class ClassBuilder:
         self.cls.py = PitmanYorParams(strength=strength, discount=discount)
 
     def finish(self) -> None:
-        """Compute the conditional-independence plan. Mirrors `finish_class!`.
+        """Turn the tracked subproblems into blocks and plans. Mirrors `finish_class!`.
 
-        NOTE (divergence): the Julia supports user-declared `subproblem` blocks that
-        split a class into several sequential SMC steps [§3.3]. We use one block per
-        class, which is the simplest thing that is still correct -- bigger enumerations,
-        better proposals, slower.
+        Each block gets its own conditional-independence forest, and SMC walks the blocks
+        in order, treating each as an intermediate target distribution [§3.3]. Reference
+        slots are plan vertices like any other -- a slot must be enumerated jointly with
+        the attributes depending on it, or its target is chosen without looking at the
+        data (see proposal._step). Parameters are never sampled, so they are in no block.
         """
-        # Reference slots ARE plan vertices: a slot must be enumerated jointly with the
-        # attributes that depend on it, or the target is chosen without looking at the
-        # data. See proposal._step and proposal._determined.
-        vertices = [v for v, n in enumerate(self.cls.nodes)
-                    if not isinstance(n, ParameterNode)]
-        self.cls.blocks = [vertices]
-        self.cls.plans = [make_plan(self.cls, vertices)]
+        blocks = []
+        for blk in self._blocks:
+            keep = [v for v in blk
+                    if not isinstance(strip_submodel(self.cls.nodes[v]), ParameterNode)]
+            if keep:
+                blocks.append(keep)
+        if not blocks:                      # a class holding nothing but parameters
+            blocks = [[]]
+        self.cls.blocks = blocks
+        self.cls.plans = [make_plan(self.cls, blk) for blk in blocks]
 
 
 class ModelBuilder:

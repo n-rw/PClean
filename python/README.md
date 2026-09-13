@@ -57,6 +57,7 @@ vertices in one topological order and get enumerated together.
 | `parameters.py` | conjugate updates in `distributions/*.jl` | Learning `@learned` quantities from the dirty data, `[App. D.2]` |
 | `example_hospital.py` | `experiments/hospital/run.jl` | Systematic-typo repair, end to end |
 | `example_physicians.py` | `experiments/physicians/run.jl` | Learned parameters on real CMS data |
+| `example_subproblems.py` | Figure 6's comparison | Subproblem hints measured: cost vs accuracy |
 
 ## On the missing `@model` macro
 
@@ -76,9 +77,10 @@ file here with the Julia to read beside it and a question to answer before movin
 ## Running it
 
 ```
-python3 python/example_hospital.py --figure1     # the systematic-typo repair
-python3 python/example_hospital.py --rows 400    # the real benchmark
-python3 python/example_physicians.py --rows 3000 # learned parameters, real CMS data
+python3 python/example_hospital.py --figure1      # the systematic-typo repair
+python3 python/example_hospital.py --rows 400     # the real benchmark
+python3 python/example_physicians.py --rows 3000  # learned parameters, real CMS data
+python3 python/example_subproblems.py             # subproblem hints, measured
 ```
 
 No dependencies beyond the standard library. The physicians example needs the CMS file;
@@ -125,6 +127,30 @@ round 1: this sample 66.8%  ...  round 5: this sample 75.9%    <- learning loop 
 
 Nobody told the model about PCOM. It counted, from the same dirty file it is cleaning,
 and then used the count to overturn a prior.
+
+## Subproblem hints, measured
+
+`subproblem begin ... end` partitions a class's variables into ordered blocks [§3.3]. SMC
+treats each as an intermediate target: enumerate jointly, commit, move on. Smaller blocks
+are cheaper and more myopic.
+
+`example_subproblems.py` runs the same model both ways — `specialty` depends on `degree`,
+so in one block they nest (15 x 50 settings) and split they do not (15 + 50):
+
+```
+cost     : 11.5x fewer settings scored (177,645 vs 2,049,750), 3.8x faster
+accuracy : 36.3% vs 37.0% (mean of 3 seeds, +0.7 points)
+```
+
+That is the paper's Figure 6 finding: an order of magnitude cheaper, landing in the same
+place. The joint enumeration sees more per step, but rejuvenation revisits every object
+anyway, so the extra sight buys little a second sweep would not. The hints change only the
+*proposal* — the model, and therefore the posterior, is identical either way.
+
+Rejuvenation is genuinely **blocked** Gibbs now, redrawing a whole subproblem at once
+rather than one variable at a time. That is not a detail: the paper is explicit that
+single-site moves get stuck, because a city's clean name and the spellings depending on it
+are too correlated for any one-variable move to escape a bad mode.
 
 ## Four bugs worth knowing about
 

@@ -67,6 +67,9 @@ class FlatProposer:
     def __init__(self, model: PCleanModel, trace: Trace):
         self.model = model
         self.trace = trace
+        # How many candidate settings we scored. This is the quantity subproblem hints
+        # exist to reduce, so it is worth being able to read it off directly.
+        self.scored = 0
 
     # ------------------------------------------------------------------ helpers
 
@@ -164,12 +167,27 @@ class FlatProposer:
     # --------------------------------------------------------------------- walk
 
     def propose(self, cls_name: str, obs: Dict[VertexID, Any]) -> RowResult:
+        """Propose one row, one subproblem at a time [§3.3].
+
+        Each block is an **intermediate target distribution**: we enumerate it jointly,
+        commit, and only then move on. Within a block, variables are chosen together and
+        see each other; across blocks they do not, because block 1's choice is already
+        fixed when block 2 is enumerated.
+
+        That is the whole trade. Two dependent variables with 15 and 60 candidates cost
+        15x60 = 900 scored settings in one block, but 15+60 = 75 in two -- at the price of
+        choosing the first without knowing the second. The paper is blunt that this makes
+        proposals "short-sighted" and that rejuvenation is what buys the sight back.
+        """
         cls = self.model.classes[cls_name]
-        plan = cls.plans[0]
         assignment: Dict[VertexID, Any] = {}
-        m, q = self._walk(cls, plan, obs, assignment)
+        total_m = total_q = 0.0
+        for plan in cls.plans:
+            m, q = self._walk(cls, plan, obs, assignment)
+            total_m += m
+            total_q += q
         oid = self._materialize(cls, cls_name, assignment, obs)
-        return RowResult(m, oid, q, assignment)
+        return RowResult(total_m, oid, total_q, assignment)
 
     def _walk(self, cls, plan: Plan, obs, assignment) -> Tuple[float, float]:
         """Sibling steps are conditionally independent, so their marginals add."""
@@ -222,6 +240,7 @@ class FlatProposer:
             options, priors = inner.dist.discrete_proposal(*args)
             scores, vals, subs, qs = [], [], [], []
             for opt, lp in zip(options, priors):
+                self.scored += 1
                 if opt is DUMMY:
                     opt = inner.dist.discrete_proposal_dummy_value(*args)
                 assignment[v] = opt
@@ -276,6 +295,7 @@ class FlatProposer:
         oids, logw = crp_candidate_log_weights(table, target_cls.py, list(table.objects))
         scores, cands, subs, qs = [], [], [], []
         for oid, lw in zip(oids, logw):
+            self.scored += 1
             assignment[v] = NewObject(v) if oid is None else oid
             scratch = dict(assignment)
             m, q = self._walk(cls, step.rest, obs, scratch)
