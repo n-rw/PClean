@@ -39,6 +39,22 @@ class Ref:
 
 
 @dataclass(frozen=True)
+class ParamLookup:
+    """An argument that means "the learned parameter at `param`, for key `key`".
+
+    `@learned degree_dist::Dict{String, ProportionsParameter}` in the Julia DSL, written
+    `degree_dist[school.name]` at the use site. `key=None` means a plain, unindexed
+    parameter (`@learned error_prob::ProbParameter`).
+
+    Indexing is what lets one declaration stand for hundreds of separate learned
+    distributions -- one per medical school, in the paper's Physicians model -- without
+    the user naming any of them.
+    """
+    param: VertexID
+    key: object = None
+
+
+@dataclass(frozen=True)
 class Via:
     """An argument reaching across one or more reference slots: `hosp.loc.county.state`.
 

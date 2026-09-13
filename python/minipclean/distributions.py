@@ -211,6 +211,10 @@ class ProportionsParameter:
         if observed in options:
             self.counts[options.index(observed)] -= 1
 
+    def reset(self):
+        """Zero the sufficient statistics, ready to be recounted."""
+        self.counts = [0] * len(self.counts)
+
     def resample(self):
         """Redraw proportions from the Dirichlet posterior given current counts.
 
@@ -270,6 +274,12 @@ class ProbParameter:
     def __init__(self, a=1.0, b=1000.0):
         self.a, self.b = a, b       # beta(1, 1000): errors are rare a priori
         self.heads = self.tails = 0
+
+    def reset(self):
+        self.heads = self.tails = 0
+
+    def resample(self):
+        pass    # `value()` already returns the posterior mean; nothing to redraw
 
     def value(self):
         return (self.a + self.heads) / (self.a + self.heads + self.b + self.tails)
@@ -452,3 +462,29 @@ class StringPrior(Distribution):
     def discrete_proposal_dummy_value(self, candidates=()):
         """A stand-in value if DUMMY is chosen — the Julia returns '***...'."""
         return "*" * ((self.min_len + self.max_len) // 2)
+
+
+class IndexedParameter:
+    """One learned parameter per key — mirrors ``IndexedParameter`` in distributions.jl.
+
+    `degree_dist[school.name]` gives a separate ProportionsParameter for every school,
+    created on first use. The paper's Physicians model has one of these per school (396
+    of them) and one per degree, all from two lines of the program [App. B.4.4].
+    """
+
+    def __init__(self, factory):
+        self.factory = factory
+        self.table = {}
+
+    def __getitem__(self, key):
+        if key not in self.table:
+            self.table[key] = self.factory()
+        return self.table[key]
+
+    def reset(self):
+        for p in self.table.values():
+            p.reset()
+
+    def resample(self):
+        for p in self.table.values():
+            p.resample()

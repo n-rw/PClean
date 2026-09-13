@@ -21,9 +21,10 @@ argument is a literal, a vertex id (use `cls.ref("other_attr")`), or a
 
 from typing import Any, Dict, List, Optional
 
-from .model import (ForeignKeyNode, JuliaNode, ParameterNode, PCleanClass,
-                    PCleanModel, PitmanYorParams, RandomChoiceNode, Ref, Via,
-                    make_plan)
+from .distributions import IndexedParameter
+from .model import (ForeignKeyNode, JuliaNode, ParameterNode, ParamLookup,
+                    PCleanClass, PCleanModel, PitmanYorParams, RandomChoiceNode,
+                    Ref, Via, make_plan)
 
 
 class ClassBuilder:
@@ -54,8 +55,14 @@ class ClassBuilder:
         args = args or []
         # A Via argument depends on the reference slot it travels through, so that slot
         # must be ordered before this node in the plan.
+        # A Via argument depends on the reference slot it travels through, and a
+        # ParamLookup on whatever keys it. Both must be ordered earlier in the plan.
         parents = ([a.v for a in args if isinstance(a, Ref)]
-                   + [a.slot for a in args if isinstance(a, Via)])
+                   + [a.slot for a in args if isinstance(a, Via)]
+                   + [a.key.slot for a in args
+                      if isinstance(a, ParamLookup) and isinstance(a.key, Via)]
+                   + [a.key.v for a in args
+                      if isinstance(a, ParamLookup) and isinstance(a.key, Ref)])
         v = self.cls.add_node(RandomChoiceNode(dist=dist, arg_node_ids=args, name=name),
                               parents)
         self._by_name[name] = v
@@ -79,10 +86,23 @@ class ClassBuilder:
         return v
 
     def learned(self, name: str, param) -> int:
-        """`@learned name::Param` — a hyperparameter shared by all objects of the class."""
+        """`@learned name::Param` — a quantity inferred from the dirty data itself."""
         v = self.cls.add_node(ParameterNode(param=param, name=name), [])
         self._by_name[name] = v
         return v
+
+    def learned_indexed(self, name: str, factory) -> int:
+        """`@learned name::Dict{String, Param}` — one learned parameter per key.
+
+        `factory` makes a fresh parameter the first time a key is seen. The paper's
+        Physicians model uses this for `degree_proportions[school]`: one distribution per
+        medical school, none of them named by the user [App. B.4.4].
+        """
+        return self.learned(name, IndexedParameter(factory))
+
+    def param(self, name: str, key=None) -> ParamLookup:
+        """Use a learned parameter as an argument: `param("degree_dist", via(...))`."""
+        return ParamLookup(self._by_name[name], key)
 
     def guaranteed(self, *attr_names: str) -> None:
         """`@guaranteed x` (the paper writes `index by x`) [App. D.4].

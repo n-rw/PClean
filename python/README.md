@@ -40,7 +40,9 @@ the Julia achieves by generating code, this achieves by walking a data structure
 | `structure_prior.py` | *(implicit in Julia)* | The CRP over reference slots, `[§2.2]`. Explicit here because it is the paper's main modeling contribution and the Julia scatters it |
 | `proposal.py` | `src/inference/proposal_compiler.jl`, `block_proposal.jl` | **The core.** Enumerative data-driven proposals, `[§3.2]` |
 | `smc.py` | `src/inference/row_inference.jl`, `inference.jl` | Per-row SMC + object-wise rejuvenation, `[§3.1]` |
-| `example_hospital.py` | `experiments/hospital/run.jl` | A runnable end-to-end example |
+| `parameters.py` | conjugate updates in `distributions/*.jl` | Learning `@learned` quantities from the dirty data, `[App. D.2]` |
+| `example_hospital.py` | `experiments/hospital/run.jl` | Systematic-typo repair, end to end |
+| `example_physicians.py` | `experiments/physicians/run.jl` | Learned parameters on real CMS data |
 
 ## On the missing `@model` macro
 
@@ -52,14 +54,21 @@ calls against a builder. All the semantics live in `builder.jl`.
 So here you call the builder directly. It is more verbose and completely transparent —
 and it is exactly what the macro compiles down to, which is the point.
 
+## Start here
+
+**[WALKTHROUGH.md](WALKTHROUGH.md)** — a reading order in six sittings, each pairing a
+file here with the Julia to read beside it and a question to answer before moving on.
+
 ## Running it
 
 ```
-python3 python/example_hospital.py          # ~200 rows of the hospital benchmark
-python3 python/example_hospital.py --rows 1000
+python3 python/example_hospital.py --figure1     # the systematic-typo repair
+python3 python/example_hospital.py --rows 400    # the real benchmark
+python3 python/example_physicians.py --rows 3000 # learned parameters, real CMS data
 ```
 
-No dependencies beyond the standard library.
+No dependencies beyond the standard library. The physicians example needs the CMS file;
+see [../PHYSICIANS-DATA.md](../PHYSICIANS-DATA.md).
 
 ## What it actually does
 
@@ -79,6 +88,21 @@ paper's central claim, reproduced in ~1,500 lines of readable Python.
 On the real benchmark (`--rows 400`) the same code gets recall 12/13 and precision 12/30.
 The recall shows the machinery works; the precision gap is a deliberate model mismatch,
 explained in `example_hospital.py`'s docstring.
+
+And `example_physicians.py`, on 3,000 real CMS clinicians with 30% of credentials hidden,
+lands three separate paper results at once:
+
+```
+round 1: this sample 55.4%  ...  round 5: this sample 69.5%    <- learning loop tightening
+  modal over 5 samples : 79.8%           <- §4, Experiment 4
+  where all 5 agreed   : 96.9% correct   <- Figure 7, calibration
+  PCOM learned : DO 77.5%, MD 8.8%       <- Figure 1 (ground truth: 84.2% DO)
+  global prior : MD 75.7%, DO 12.9%
+  held-out PCOM clinicians: 10/14 correct (the prior says MD for all 14)
+```
+
+Nobody told the model about PCOM. It counted, from the same dirty file it is cleaning,
+and then used the count to overturn a prior.
 
 ## The two bugs worth knowing about
 

@@ -51,8 +51,9 @@ from .distributions import DUMMY, logsumexp
 def enumerate_first(vs):
     """The target attributes we enumerate jointly with the reference choice."""
     return vs[:1]
-from .model import (ForeignKeyNode, JuliaNode, ParameterNode, PCleanClass,
-                    PCleanModel, Plan, RandomChoiceNode, Ref, Via, VertexID)
+from .model import (ForeignKeyNode, JuliaNode, ParameterNode, ParamLookup,
+                    PCleanClass, PCleanModel, Plan, RandomChoiceNode, Ref, Via,
+                    VertexID)
 from .structure_prior import crp_candidate_log_weights
 from .trace import LatentObject, Trace
 
@@ -119,7 +120,17 @@ class Proposer:
         """
         out = []
         for a in node.arg_node_ids:
-            if isinstance(a, Via):
+            if isinstance(a, ParamLookup):
+                param = cls.nodes[a.param].param
+                if a.key is None:
+                    out.append(param)
+                else:
+                    sub = self._resolve_args(
+                        cls, _OneArg([a.key]), assignment, slots)
+                    if sub is None:
+                        return None
+                    out.append(param[sub[0]])
+            elif isinstance(a, Via):
                 # Walk the reference chain hop by hop: hosp -> city -> name.
                 oid = slots.get(a.slot)
                 if oid is None:
@@ -521,6 +532,13 @@ class Proposer:
 
 
 # ------------------------------------------------------------------- helpers
+
+class _OneArg:
+    """Tiny shim so a single argument can go through `_resolve_args` unchanged."""
+
+    def __init__(self, args):
+        self.arg_node_ids = args
+
 
 def _vertex_by_name(cls: PCleanClass, name: str) -> Optional[VertexID]:
     for v in range(len(cls.nodes)):
