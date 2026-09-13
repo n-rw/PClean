@@ -34,8 +34,7 @@ from minipclean.builder import ModelBuilder
 from minipclean.distributions import (ChooseProportionally, MaybeSwap, ProbParameter,
                                       ProportionsParameter, Unmodeled)
 from minipclean.parameters import fit_parameters, show_distribution
-from minipclean.proposal import ObsNode
-from minipclean.smc import SMC, Rejuvenator
+from minipclean.smc import SMC, Rejuvenator, encode_rows
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -125,9 +124,11 @@ def load(limit, holdout, seed):
     rows, truth, hidden = [], [], []
     for k in kept:
         hide = rng.random() < holdout
-        rows.append(ObsNode(children={"physician": ObsNode(
-            attrs={"npi": k["npi"], "obs_degree": None if hide else k["cred"]},
-            children={"school": ObsNode(attrs={"name": k["school"]})})}))
+        # Flat, dotted observations -- exactly what `@query` expresses. Each key names a
+        # vertex that flattening put into `Record`'s own graph.
+        rows.append({"physician.npi": k["npi"],
+                     "physician.school.name": k["school"],
+                     "physician.obs_degree": None if hide else k["cred"]})
         truth.append(k["cred"])
         hidden.append(hide)
     return rows, truth, hidden, kept
@@ -150,17 +151,17 @@ def main():
           f"{len({k['school'] for k in raw})} schools | {n_hidden} credentials hidden")
 
     model = build_model(degrees, concentration=args.concentration)
+    enc = encode_rows(model, "Record", rows)
 
     print("\n--- SMC [§3.1] ---")
-    smc = SMC(model, n_particles=1)
-    trace = smc.run(rows, progress_every=max(1, len(rows) // 3))
+    smc = SMC(model)
+    trace = smc.run(enc, progress_every=max(1, len(rows) // 3))
     print(f"  latent database: {trace.summary()}")
 
-    rej = Rejuvenator(model, trace, rows, smc.row_assignments)
+    rej = Rejuvenator(model, trace, enc, smc)
     pn = model.classes["Physician"]
-    deg_v = [v for v in range(len(pn.nodes)) if pn.node_name(v) == "degree"][0]
-    rphys_v = [v for v in range(len(model.classes["Record"].nodes))
-               if model.classes["Record"].node_name(v) == "physician"][0]
+    deg_v = pn.names["degree"]
+    rphys_v = model.classes["Record"].names["physician"]
 
     def predictions():
         """The current posterior sample's guess for every hidden credential."""
@@ -214,7 +215,7 @@ def main():
 
     # ---- What did it learn, and did the school beat the prior? -----------------
     print("\n--- What was learned ---")
-    dd = [n for n in pn.nodes if getattr(n, "name", "") == "degree_dist"][0].param
+    dd = pn.nodes[pn.names["degree_dist"]].param
     glob = Counter(k["cred"] for k in raw)
     gtot = sum(glob.values())
     print("  global (the prior):        " +

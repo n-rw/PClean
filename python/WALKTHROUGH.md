@@ -69,12 +69,19 @@ proposal — for finite-discrete subproblems, exactly the posterior.
 The Julia does this by **generating and `eval`ing code** (line 421). We interpret the same
 Plan. That is the only deep difference between this package and the original.
 
-Then read `_enumerate_reference` and the comment above it. It documents a bug this code
-actually had: resolve a reference slot *before* scoring its dependents and the target is
-chosen blind — everything collapsed onto `'opp'`, the shortest city name. References must
-be enumerated **jointly** with what depends on them.
+Then read `_step` and `_determined`. Every flattened vertex has a CPD that switches on
+what its slot turned out to be (Algorithm 1): points at an existing object → the attribute
+is *determined*, look it up and score nothing; creates a new object → enumerate it for
+real. Because slot and attributes are adjacent vertices in one topological order, choosing
+the city and scoring the typo happen in the same enumeration, with no special case.
 
-> **Question:** That bug is exactly what flattening prevents, for free. Why?
+An earlier draft of this package recursed across classes instead, resolving a slot before
+scoring its dependents. It scored **0/13** on the two-hop benchmark model — every repair
+wrong, everything collapsing onto `'opp'`, the shortest city name. Flattening took it to
+**13/13**.
+
+> **Question:** Why does flattening make that failure structurally impossible, rather than
+> just less likely?
 
 ---
 
@@ -155,7 +162,7 @@ Stated plainly so you don't mistake a simplification for the design:
 | | Julia | here |
 |---|---|---|
 | Proposals | generated + JIT-compiled, memoized | interpreted, ~50× slower |
-| Cross-class deps | flattened into one Bayes net | recursive; nested new-object slots fall back to the prior |
+| Cross-class deps | flattened into one Bayes net | **flattened too** — `builder.reference()` |
 | Subproblem blocking `[§3.3]` | user-declared, splits SMC steps | one block per class |
 | Parameters | incremental sufficient statistics | full recount each round |
 | Particle cloning | persistent structure, O(1) | deep copy, O(database) |
@@ -163,5 +170,5 @@ Stated plainly so you don't mistake a simplification for the design:
 | Garbage collection | unreferenced objects deleted | not implemented |
 | String prior | English character-bigram LM | flat per-character cost |
 
-The first two are the ones that change *answers*, not just speed — the rest are honest
-shortcuts. Everything is flagged at its site with a `NOTE (divergence)` comment.
+Only the first changes *answers* now — the rest are honest shortcuts in speed or in
+scope. Everything is flagged at its site with a `NOTE (divergence)` comment.

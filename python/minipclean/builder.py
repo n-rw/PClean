@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 from .distributions import IndexedParameter
 from .model import (ForeignKeyNode, JuliaNode, ParameterNode, ParamLookup,
                     PCleanClass, PCleanModel, PitmanYorParams, RandomChoiceNode,
-                    Ref, Via, make_plan)
+                    Ref, SubmodelNode, Via, make_plan, shift_node)
 
 
 class ClassBuilder:
@@ -36,7 +36,7 @@ class ClassBuilder:
         self.cls = PCleanClass(name=name)
         model.classes[name] = self.cls
         model.class_order.append(name)
-        self._by_name: Dict[str, int] = {}
+        self._by_name: Dict[str, int] = self.cls.names
 
     # -- lookups ----------------------------------------------------------------
 
@@ -44,9 +44,20 @@ class ClassBuilder:
         """Reference a previously declared node, for use in an `args` list."""
         return Ref(self._by_name[attr_name])
 
-    def via(self, slot_name: str, *path: str) -> Via:
-        """An argument reaching across reference slots: `via("hosp", "city", "name")`."""
-        return Via(self._by_name[slot_name], tuple(path))
+    def via(self, slot_name: str, *path: str) -> Ref:
+        """An argument reaching across reference slots: `via("hosp", "city", "name")`.
+
+        After flattening this is no longer a "reach" at all -- `hosp.city.name` is a
+        vertex of *this* class, so this is an ordinary local lookup. The method is kept
+        because it reads like the model, and because it is the one place you can see
+        flattening paying off: the multi-hop walk that used to happen at inference time
+        now happened once, at model-construction time.
+        """
+        key = ".".join((slot_name,) + path)
+        if key not in self._by_name:
+            raise KeyError(f"{key!r} is not a flattened vertex of {self.name!r}; "
+                           f"available: {sorted(k for k in self._by_name if '.' in k)}")
+        return Ref(self._by_name[key])
 
     # -- declarations -----------------------------------------------------------
 
@@ -69,12 +80,60 @@ class ClassBuilder:
         return v
 
     def reference(self, name: str, target_class: str) -> int:
-        """`name ~ TargetClass` — a reference slot.
+        """`name ~ TargetClass` — a reference slot. **This is where flattening happens.**
 
-        The structure prior decides how many objects of `target_class` exist and which
-        of them this slot points at; see structure_prior.py [§2.2].
+        Mirrors `add_foreign_key!` in builder.jl, and it does much more than add one node.
+        It *absorbs the entire target class* into this one:
+
+          1. add the reference slot itself, at vertex `v`;
+          2. copy every node of the target class in after it, shifting all argument
+             indices by `v+1` (`shift_node`), and record the correspondence in `vmap`;
+          3. copy the target's internal edges, shifted the same way;
+          4. wire `v -> each copy`, because what those copies mean depends entirely on
+             which object the slot points at;
+          5. wire every *earlier* slot targeting the same class into `v`, since this slot
+             might turn out to point at the same new object one of those created.
+
+        Because the target class was itself flattened when it was declared, this is
+        transitive: flattening `Practice` into `Record` brings `City` along with it. So
+        `hosp.loc.county.state` ends up as a single vertex in `Record`'s graph, three
+        slots deep, and inference over a row is inference over one ordinary Bayes net.
+
+        The payoff is in proposal.py: choosing what a slot points at and scoring the
+        attributes that depend on it become *the same enumeration*, automatically,
+        because they are now vertices in one graph with one topological order. Get this
+        wrong -- resolve the slot first, score afterwards -- and the slot is chosen blind.
+
+        Requires the target class to be declared first. The class dependency graph must
+        be acyclic anyway [App. C.3], so a topological declaration order always exists.
         """
+        if target_class not in self.model.classes:
+            raise ValueError(
+                f"class {target_class!r} must be declared before {self.name!r} "
+                f"references it (flattening copies its nodes in, so it has to exist)")
+        target = self.model.classes[target_class]
+
         v = self.cls.add_node(ForeignKeyNode(target_class=target_class, name=name), [])
+        offset = v + 1
+        fk = self.cls.nodes[v]
+        fk.vmap = {i: i + offset for i in range(len(target.nodes))}
+
+        # Earlier slots to the same class are parents: this slot's choice is not
+        # independent of theirs (they may share a newly created object).
+        for w, n in enumerate(self.cls.nodes[:v]):
+            if isinstance(n, ForeignKeyNode) and n.target_class == target_class:
+                self.cls.edges[v].append(w)
+                self.cls.edges[v].extend(n.vmap.values())
+
+        for i, node in enumerate(target.nodes):
+            copied = shift_node(node, offset)
+            sub = SubmodelNode(foreign_key_node_id=v, subnode_id=i, subnode=copied,
+                               name=f"{name}.{target.node_name(i)}")
+            # parents: the slot itself, plus the shifted parents from the target's graph
+            parents = [v] + [p + offset for p in target.parents(i)]
+            w = self.cls.add_node(sub, parents)
+            self._by_name[f"{name}.{target.node_name(i)}"] = w
+
         self._by_name[name] = v
         return v
 
@@ -129,7 +188,7 @@ class ClassBuilder:
         """
         # Reference slots ARE plan vertices: a slot must be enumerated jointly with the
         # attributes that depend on it, or the target is chosen without looking at the
-        # data. See proposal._enumerate_reference.
+        # data. See proposal._step and proposal._determined.
         vertices = [v for v, n in enumerate(self.cls.nodes)
                     if not isinstance(n, ParameterNode)]
         self.cls.blocks = [vertices]

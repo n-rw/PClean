@@ -145,6 +145,63 @@ class ParameterNode(Node):
     name: str = ""
 
 
+@dataclass(frozen=True)
+class NewObject:
+    """A candidate value for a reference slot meaning "invent a fresh object here".
+
+    A reference slot's domain is every object of the target class that already exists,
+    plus this. `owner` is the slot that would create it -- two slots pointing at the same
+    class can also share *one* new object, which is the `new_{u\'}` case of Algorithm 1,
+    so the sentinel has to say which slot the object belongs to.
+    """
+    owner: VertexID
+
+
+def shift_node(node: Node, offset: int) -> Node:
+    """Copy a node with all its argument indices moved by `offset`.
+
+    Mirrors the Julia's `copy_node`. This is the mechanical heart of flattening: a node
+    that referred to vertex 3 of its own class must refer to vertex 3+offset once it has
+    been copied into the referring class's graph.
+    """
+    if isinstance(node, RandomChoiceNode):
+        return RandomChoiceNode(dist=node.dist,
+                                arg_node_ids=[_shift_arg(a, offset)
+                                              for a in node.arg_node_ids],
+                                name=node.name)
+    if isinstance(node, JuliaNode):
+        return JuliaNode(f=node.f,
+                         arg_node_ids=[_shift_arg(a, offset) for a in node.arg_node_ids],
+                         name=node.name)
+    if isinstance(node, ForeignKeyNode):
+        return ForeignKeyNode(target_class=node.target_class,
+                              vmap={k: v + offset for k, v in node.vmap.items()},
+                              name=node.name)
+    if isinstance(node, ParameterNode):
+        return node          # parameters are shared, not copied
+    if isinstance(node, SubmodelNode):
+        return SubmodelNode(foreign_key_node_id=node.foreign_key_node_id + offset,
+                            subnode_id=node.subnode_id,
+                            subnode=shift_node(node.subnode, offset),
+                            name=node.name)
+    raise TypeError(node)
+
+
+def _shift_arg(a, offset: int):
+    if isinstance(a, Ref):
+        return Ref(a.v + offset)
+    if isinstance(a, Via):
+        return Via(a.slot + offset, a.path)
+    if isinstance(a, ParamLookup):
+        # Both indices move. The parameter *object* is shared across classes (see
+        # shift_node), but the *vertex* that holds it is a position in this class's node
+        # list, so it shifts like any other. Miss this and a lookup silently resolves to
+        # whichever parameter happens to sit at the old index.
+        return ParamLookup(a.param + offset,
+                           _shift_arg(a.key, offset) if a.key is not None else None)
+    return a
+
+
 def strip_submodel(node: Node) -> Node:
     """Peel SubmodelNode wrappers to get at the real node. Mirrors `strip_subnodes`."""
     while isinstance(node, SubmodelNode):
@@ -260,6 +317,10 @@ class PCleanClass:
     plans: List[Plan] = field(default_factory=list)
 
     py: PitmanYorParams = field(default_factory=PitmanYorParams)
+
+    # name -> vertex, including flattened dotted names like "practice.city.name".
+    # The Julia keeps the same map (`PCleanClass.names`).
+    names: Dict[str, VertexID] = field(default_factory=dict)
 
     def add_node(self, node: Node, parents: List[VertexID]) -> VertexID:
         idx = len(self.nodes)

@@ -40,15 +40,22 @@ from typing import Any, Dict, List
 
 from .distributions import (ChooseProportionally, IndexedParameter, MaybeSwap,
                             ProbParameter, ProportionsParameter)
-from .model import ParameterNode, ParamLookup, PCleanModel, RandomChoiceNode
+from .model import (ParameterNode, ParamLookup, PCleanModel, RandomChoiceNode,
+                    strip_submodel)
 from .trace import Trace
 
 
 def _all_parameters(model: PCleanModel):
+    """Every distinct learned parameter. Flattening means one parameter object can be
+    reachable from several classes, so de-duplicate by identity or it gets reset twice
+    and counted twice."""
+    seen = set()
     for cls in model.classes.values():
         for node in cls.nodes:
-            if isinstance(node, ParameterNode):
-                yield node.param
+            inner = strip_submodel(node)
+            if isinstance(inner, ParameterNode) and id(inner.param) not in seen:
+                seen.add(id(inner.param))
+                yield inner.param
 
 
 def fit_parameters(model: PCleanModel, trace: Trace, verbose: bool = False) -> None:
@@ -63,21 +70,23 @@ def fit_parameters(model: PCleanModel, trace: Trace, verbose: bool = False) -> N
     Call this after SMC and after each rejuvenation sweep. Because inference and learning
     feed each other, repeating the cycle is what sharpens both.
     """
-    from .proposal import Proposer
+    from .proposal import FlatProposer
 
     for p in _all_parameters(model):
         p.reset()
 
-    proposer = Proposer(model, trace)
+    proposer = FlatProposer(model, trace)
 
     for cls_name, cls in model.classes.items():
         for obj in trace.table(cls_name).objects.values():
             for v, node in enumerate(cls.nodes):
+                if "." in cls.node_name(v):
+                    continue          # a flattened copy; the owning object counts it
                 if not isinstance(node, RandomChoiceNode) or v not in obj.values:
                     continue
                 if not any(isinstance(a, ParamLookup) for a in node.arg_node_ids):
                     continue
-                args = proposer._resolve_args(cls, node, obj.values, obj.values)
+                args = proposer._args(cls, node, obj.values)
                 if args is None:
                     continue
                 value = obj.values[v]
@@ -106,10 +115,11 @@ def report(model: PCleanModel, max_keys: int = 4) -> None:
     """Print what was learned. Useful for convincing yourself it counted the right thing."""
     for cls_name, cls in model.classes.items():
         for v, node in enumerate(cls.nodes):
-            if not isinstance(node, ParameterNode):
+            inner = strip_submodel(node)
+            if not isinstance(inner, ParameterNode) or "." in cls.node_name(v):
                 continue
             name = cls.node_name(v)
-            p = node.param
+            p = inner.param
             if isinstance(p, IndexedParameter):
                 print(f"  {cls_name}.{name}: {len(p.table)} keys learned")
             elif isinstance(p, ProbParameter):
