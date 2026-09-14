@@ -58,6 +58,7 @@ vertices in one topological order and get enumerated together.
 | `example_hospital.py` | `experiments/hospital/run.jl` | Systematic-typo repair, end to end |
 | `example_physicians.py` | `experiments/physicians/run.jl` | Learned parameters on real CMS data |
 | `example_subproblems.py` | Figure 6's comparison | Subproblem hints measured: cost vs accuracy |
+| `example_gc.py` | the GC half-sentence in `[§3.1]` | Garbage collection, and why it is not housekeeping |
 
 ## On the missing `@model` macro
 
@@ -81,6 +82,7 @@ python3 python/example_hospital.py --figure1      # the systematic-typo repair
 python3 python/example_hospital.py --rows 400     # the real benchmark
 python3 python/example_physicians.py --rows 3000  # learned parameters, real CMS data
 python3 python/example_subproblems.py             # subproblem hints, measured
+python3 python/example_gc.py                      # garbage collection and the prior's support
 ```
 
 No dependencies beyond the standard library. The physicians example needs the CMS file;
@@ -152,7 +154,27 @@ rather than one variable at a time. That is not a detail: the paper is explicit 
 single-site moves get stuck, because a city's clean name and the spellings depending on it
 are too correlated for any one-variable move to escape a bad mode.
 
-## Four bugs worth knowing about
+## Garbage collection is not housekeeping
+
+Rejuvenation revises reference slots, not just attributes [§3.1], so an object can lose
+its last referrer. The paper disposes of this in half a sentence, which undersells it. The
+structure prior places mass **only** on skeletons where every object is reachable from the
+observed data [§2.2] — so an unreachable object is not untidy, it is a state of
+probability zero, and a database containing one is not a sample from the posterior.
+
+Nor is it inert. `example_gc.py` injects 25 phantoms into a settled database:
+
+```
+before            : 17 cities, 17 candidate targets, P(next invents new) = 0.0333
++25 phantoms      : 42 cities, 42 candidate targets, P(next invents new) = 0.0182   VIOLATED
+after collection  : 17 cities, 17 candidate targets, P(next invents new) = 0.0333   HOLDS
+```
+
+The reconstructed dataset is byte-for-byte identical throughout — every accuracy number
+looks the same — while the prior has moved 45%. That is the failure mode: not a leak, a
+silent bias on every entity-resolution decision that follows.
+
+## Five bugs worth knowing about
 
 All four were live in this code. Each is one of the paper's ideas showing up in negative,
 so each is documented where it happened rather than quietly fixed.
@@ -170,7 +192,14 @@ so each is documented where it happened rather than quietly fixed.
    slot and every city looks undetermined whenever the practice is new, and all 29
    practices collapse onto one city. See `proposal._owner_slot`.
 
-4. **Caching flattened copies on every referring object.** Then rejuvenation scores
+4. **Leave-one-out that deletes the option of staying put.** Gibbs over a CRP removes
+   the item before weighing candidates — but an object this slot is the *sole* referrer
+   of then has count 0, and a zero-weight candidate gets dropped. The slot is forced to
+   move, and every singleton entity is destroyed on the first sweep. Re-seating at a table
+   you just vacated is the same event as starting a fresh one, so it takes the new-table
+   weight. See `smc.Rejuvenator._settings`.
+
+5. **Caching flattened copies on every referring object.** Then rejuvenation scores
    candidates against a stale value, every candidate scores identically, and the prior
    decides — which looks exactly like inference working. One source of truth: an
    attribute lives on the object that owns it. See `proposal._determined`.

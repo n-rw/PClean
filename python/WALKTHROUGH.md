@@ -184,6 +184,29 @@ one variable at a time. The paper is explicit that single-site moves get stuck.
 
 ---
 
+## 8. The state the prior forbids
+
+**Read:** `minipclean/structure_prior.py` → `collect_garbage`, then `smc.Rejuvenator._targets`
+
+Rejuvenation revises reference slots, not only attributes [§3.1] — which means an object
+can lose its last referrer. The structure prior places mass only on skeletons where every
+object is reachable from the data [§2.2], so such an object is not untidy, it is a state
+of probability zero.
+
+```
+$ python3 python/example_gc.py
++25 phantoms      : 42 cities, 42 candidates, P(next invents new) = 0.0182   VIOLATED
+after collection  : 17 cities, 17 candidates, P(next invents new) = 0.0333   HOLDS
+```
+
+The reconstructed dataset is identical either way. The prior is not.
+
+> **Question:** `_targets` refuses to revise a slot whose target class has guaranteed
+> keys. Why is that correct rather than merely convenient — and what would go wrong on the
+> hospital benchmark without it? (It scored 4/299 before this check existed.)
+
+---
+
 ## Where this translation is weaker than the Julia
 
 Stated plainly so you don't mistake a simplification for the design:
@@ -195,9 +218,9 @@ Stated plainly so you don't mistake a simplification for the design:
 | Subproblem blocking `[§3.3]` | user-declared, splits SMC steps | **implemented** — `builder.subproblem()` |
 | Parameters | incremental sufficient statistics | full recount each round |
 | Rejuvenation scoring | incremental, exploits the Plan forest | blocked, but rescores whole settings |
+| New objects in rejuvenation | slots may insert fresh objects | existing targets only |
 | Particle cloning | persistent structure, O(1) | deep copy, O(database) |
 | Continuous variables `[App. D.2]` | Particle Gibbs rejuvenation | prior sampling only |
-| Garbage collection | unreferenced objects deleted | not implemented |
 | String prior | English character-bigram LM | flat per-character cost |
 
 Only the first changes *answers* now — the rest are honest shortcuts in speed or in

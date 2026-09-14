@@ -33,7 +33,7 @@ than others [App. C.3, footnote].
 import math
 from typing import List, Tuple
 
-from .model import PitmanYorParams
+from .model import ForeignKeyNode, PitmanYorParams, strip_submodel as _strip
 from .trace import Table
 
 
@@ -67,3 +67,96 @@ def crp_candidate_log_weights(table: Table, py: PitmanYorParams,
     weights.append(math.log(new_weight) if new_weight > 0 else -math.inf)
 
     return oids, weights
+
+
+def reachable_objects(model, trace) -> set:
+    """Every ``(class, oid)`` reachable from the observation class by reference slots."""
+    obs_cls = model.observation_class
+    seen, frontier = set(), [(obs_cls, oid) for oid in trace.table(obs_cls).objects]
+    while frontier:
+        key = frontier.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        cname, oid = key
+        cls = model.classes[cname]
+        obj = trace.table(cname).objects.get(oid)
+        if obj is None:
+            continue
+        for v, node in enumerate(cls.nodes):
+            if "." in cls.node_name(v):
+                continue                 # a flattened copy; the owner holds the real slot
+            inner = _strip(node)
+            if isinstance(inner, ForeignKeyNode) and v in obj.values:
+                frontier.append((inner.target_class, obj.values[v]))
+    return seen
+
+
+def recount_references(model, trace) -> None:
+    """Recompute every object's ``ref_count`` from the surviving reference slots.
+
+    `ref_count` is the CRP's ``n_r``. The Julia maintains it incrementally, and so do we
+    during a sweep, but after garbage collection it is worth restoring from scratch: it
+    makes the invariant explicit, and a count that has drifted is otherwise invisible --
+    inference keeps running, just against a prior that believes in objects nobody
+    references.
+    """
+    for cname in model.classes:
+        for obj in trace.table(cname).objects.values():
+            obj.ref_count = 0
+    for cname, cls in model.classes.items():
+        for obj in trace.table(cname).objects.values():
+            for v, node in enumerate(cls.nodes):
+                if "." in cls.node_name(v):
+                    continue
+                inner = _strip(node)
+                if isinstance(inner, ForeignKeyNode) and v in obj.values:
+                    target = trace.table(inner.target_class).objects.get(obj.values[v])
+                    if target is not None:
+                        target.ref_count += 1
+
+
+def collect_garbage(model, trace) -> int:
+    """Delete objects no longer reachable from the observed data. Returns how many.
+
+    ## Why this is not housekeeping
+
+    It is tempting to read "garbage collection" as memory management. It is not. Go back
+    to the structure prior [§2.2]:
+
+        p(S; |D|, C) places mass only on relational skeletons in which there are exactly
+        |D| objects in C_obs and **every other object is connected via some chain of
+        reference slots to one of them**.
+
+    An object nothing can reach is therefore not a slightly wasteful state -- it is a
+    state the prior assigns **zero** probability. A latent database containing one is not
+    a sample from the posterior at all, however good its other numbers look.
+
+    ## When objects become unreachable
+
+    Only when a reference slot moves, which is why this arrives together with slot
+    revision in rejuvenation [§3.1]: "these moves may also lead to the garbage collection
+    of objects that are no longer connected to the observed dataset". Suppose two
+    practices are the only ones citing a particular City, and rejuvenation decides both
+    actually belong to a differently-spelled City. The abandoned one still sits in the
+    table, still counts toward `len(table)` in the CRP's `s + d*n_objects` term, and is
+    still offered as a candidate target to every future row -- a phantom entity competing
+    for references.
+
+    Mark and sweep, from the observation class outward. The index is pruned too: a stale
+    entry would let a hash-key lookup hand back an object that no longer exists.
+    """
+    keep = reachable_objects(model, trace)
+    removed = 0
+    for cname in model.classes:
+        if cname == model.observation_class:
+            continue           # one object per row, always, by construction [§2.2]
+        table = trace.table(cname)
+        for oid in list(table.objects):
+            if (cname, oid) not in keep:
+                del table.objects[oid]
+                removed += 1
+        table.index = {k: v for k, v in table.index.items() if v in table.objects}
+    if removed:
+        recount_references(model, trace)
+    return removed

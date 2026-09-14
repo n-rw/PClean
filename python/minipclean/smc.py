@@ -13,6 +13,7 @@ from .distributions import DUMMY, logsumexp
 from .model import (ForeignKeyNode, PCleanModel, RandomChoiceNode, VertexID,
                     strip_submodel)
 from .parameters import fit_parameters
+from .structure_prior import collect_garbage, crp_candidate_log_weights
 from .proposal import FlatProposer, _sample
 from .trace import Trace
 
@@ -104,8 +105,11 @@ class Rejuvenator:
     """
 
     def __init__(self, model: PCleanModel, trace: Trace,
-                 rows: List[Dict[VertexID, Any]], smc: SMC):
+                 rows: List[Dict[VertexID, Any]], smc: SMC, gc: bool = True):
         self.model = model
+        # Collect unreachable objects after each sweep. Off only to demonstrate what
+        # goes wrong without it -- see example_gc.py.
+        self.gc = gc
         self.trace = trace
         # (cls, oid) -> {vertex in that class: observed value}. One entry per object,
         # which is exactly what makes the counting per-object.
@@ -115,6 +119,8 @@ class Rejuvenator:
         # Joint settings scored across all blocked updates -- the cost subproblem hints
         # are there to reduce.
         self.scored = 0
+        # Objects removed by the most recent sweep.
+        self.collected = 0
 
         obs_cls = model.observation_class
         for row, omap, root_oid in zip(rows, smc.owner_maps, smc.row_assignments):
@@ -189,18 +195,44 @@ class Rejuvenator:
             for oid, obj in list(self.trace.table(cname).objects.items()):
                 for block in cls.blocks:
                     changed += self._update_block(cls, cname, obj, block, verbose)
+
+        # Slots moved, so some objects may now be unreachable from the data -- states the
+        # structure prior gives zero mass [§2.2]. Collect them before anyone reads the
+        # database again.
+        self.collected = collect_garbage(self.model, self.trace) if self.gc else 0
+        if verbose and self.collected:
+            print(f"    collected {self.collected} unreachable object(s)")
         return changed
 
     def _targets(self, cls, cname, obj, block) -> List[VertexID]:
-        """Which vertices of this block are actually free to move."""
+        """Which vertices of this block are free to move.
+
+        Reference slots are included. The paper is explicit that a rejuvenation move
+        updates "all r's attributes **and reference slots**" [§3.1] -- and it is the slot
+        moves that make garbage collection necessary at all, because the object a slot
+        abandons may have nothing else pointing at it.
+        """
         obs = self.obj_obs.get((cname, obj.oid), {})
         out = []
         for v in block:
+            if "." in cls.node_name(v):
+                continue                      # owned by another object
             node = strip_submodel(cls.nodes[v])
+            if isinstance(node, ForeignKeyNode):
+                # A slot into a class with guaranteed keys is *pinned*, not free.
+                # `@guaranteed` says the key field is trusted and always observed, so
+                # identity is settled by exact lookup -- App. D.4's index reduces the
+                # legal targets to a singleton. Revising such a slot lets a Record drift
+                # onto a Practice with a different provider number, which is not a
+                # hypothesis the model entertains.
+                if self.model.classes[node.target_class].hash_keys:
+                    continue
+                out.append(v)
+                continue
             if not isinstance(node, RandomChoiceNode):
                 continue
-            if v in cls.hash_keys or "." in cls.node_name(v) or v in obs:
-                continue      # trusted key / owned by another object / directly observed
+            if v in cls.hash_keys or v in obs:
+                continue      # trusted key / directly observed
             if not node.dist.has_discrete_proposal():
                 continue
             out.append(v)
@@ -222,6 +254,45 @@ class Rejuvenator:
         v = targets[i]
         node = strip_submodel(cls.nodes[v])
         obj.values.update(cur)
+
+        if isinstance(node, ForeignKeyNode):
+            # Candidate targets for a reference slot, weighted by the CRP.
+            #
+            # Leave-one-out: this object's own reference is removed from the counts
+            # before weighing candidates. That is what makes the move a correct Gibbs
+            # step -- you are asking "given every *other* reference, where should this
+            # one go?", not letting the slot vote for its own current target.
+            table = self.trace.table(node.target_class)
+            cur_target = obj.values.get(v)
+            if cur_target is not None and cur_target in table.objects:
+                table.objects[cur_target].ref_count -= 1
+            py = self.model.classes[node.target_class].py
+            oids, weights = crp_candidate_log_weights(table, py, list(table.objects))
+            if cur_target is not None and cur_target in table.objects:
+                table.objects[cur_target].ref_count += 1
+
+            # Staying put must remain an option. After the leave-one-out decrement, an
+            # object this slot is the *sole* referrer of has count 0, and a zero-weight
+            # candidate is dropped -- so without this the slot would be *forced* to move,
+            # and every singleton entity would be destroyed on the first sweep.
+            #
+            # In CRP terms, re-seating at a table you just vacated is the same event as
+            # starting a fresh one, so it takes the new-table weight.
+            new_w = math.log(py.strength + py.discount * len(table)) \
+                if py.strength + py.discount * len(table) > 0 else -math.inf
+            if cur_target is not None and cur_target not in oids:
+                oids = list(oids) + [cur_target]
+                weights = list(weights) + [new_w]
+
+            for oid, w in zip(oids, weights):
+                if oid is None:
+                    continue      # see NOTE in _update_block: we do not insert new
+                                  # objects during rejuvenation
+                cur[v] = oid
+                self._settings(cls, obj, targets, i + 1, cur, lp + w, out)
+            cur.pop(v, None)
+            return
+
         args = FlatProposer(self.model, self.trace)._args(cls, node, obj.values)
         if args is None:
             self._settings(cls, obj, targets, i + 1, cur, lp, out)
@@ -280,6 +351,23 @@ class Rejuvenator:
         if marginal == -math.inf:
             return 0
         chosen, _ = settings[_sample(scores, marginal)]
+
+        # Keep the CRP's counts honest. `ref_count` is the n_r that drives rich-get-richer
+        # weighting in structure_prior.py, so a slot that moves without decrementing its
+        # old target leaves the prior permanently pointing at a phantom.
+        for v in targets:
+            if not isinstance(strip_submodel(cls.nodes[v]), ForeignKeyNode):
+                continue
+            before, after = old.get(v), chosen.get(v)
+            if before == after:
+                continue
+            tname = strip_submodel(cls.nodes[v]).target_class
+            tbl = self.trace.table(tname)
+            if before is not None and before in tbl.objects:
+                tbl.objects[before].ref_count -= 1
+            if after is not None and after in tbl.objects:
+                tbl.objects[after].ref_count += 1
+
         obj.values.update(chosen)
         n = sum(1 for v in targets if chosen.get(v) != old.get(v))
         if verbose and n:
