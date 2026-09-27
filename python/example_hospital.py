@@ -84,6 +84,7 @@ def build_systematic(candidates):
 
 
 def load_benchmark(limit):
+    """Load clean and dirty hospital data.  For each provider, align the clean and dirty city names."""
     d = os.path.join(REPO, "datasets")
     with open(os.path.join(d, "hospital_dirty.csv"), newline="",
               encoding="utf-8", errors="replace") as f:
