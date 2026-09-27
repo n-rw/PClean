@@ -121,6 +121,9 @@ class Rejuvenator:
         self.scored = 0
         # Objects removed by the most recent sweep.
         self.collected = 0
+        # Optional decision log for the visualizer (../viz), as in FlatProposer: None is
+        # off; a list receives one dict per blocked update that had a choice to make.
+        self.log: Optional[list] = None
 
         obs_cls = model.observation_class
         for row, omap, root_oid in zip(rows, smc.owner_maps, smc.row_assignments):
@@ -138,8 +141,18 @@ class Rejuvenator:
                     # do, every per-row observation becomes invisible to rejuvenation.
                     self.obj_obs.setdefault((obs_cls, root_oid), {})[local_v] = val
 
-        for cname, cls in model.classes.items():
-            for oid, obj in trace.table(cname).objects.items():
+        self._build_referrers()
+
+    def _build_referrers(self) -> None:
+        """Recompute who points at whom from the database as it stands.
+
+        This has to be kept current, not built once. Rejuvenation moves reference slots,
+        and a City's evidence is read *through* its referrers -- so a stale map scores a
+        city against practices that have left it and ignores ones that have joined.
+        """
+        self.referrers = {}
+        for cname, cls in self.model.classes.items():
+            for oid, obj in self.trace.table(cname).objects.items():
                 for v, node in enumerate(cls.nodes):
                     inner = strip_submodel(node)
                     if isinstance(inner, ForeignKeyNode) and v in obj.values:
@@ -200,6 +213,8 @@ class Rejuvenator:
         # structure prior gives zero mass [§2.2]. Collect them before anyone reads the
         # database again.
         self.collected = collect_garbage(self.model, self.trace) if self.gc else 0
+        if self.collected:
+            self._build_referrers()
         if verbose and self.collected:
             print(f"    collected {self.collected} unreachable object(s)")
         return changed
@@ -335,22 +350,29 @@ class Rejuvenator:
             return 0
 
         refs = self._transitive_referrers(cname, obj.oid)
-        scores = []
+        scores, evidence = [], []
         for vals, lp in settings:
             obj.values.update(vals)
-            s = lp + self._score_local(cls, cname, obj)
-            for (rc, ro) in refs:
+            own = self._score_local(cls, cname, obj)
+            s = lp + own
+            ev = [(cname, obj.oid, own)] if own else []
+            for (rc, ro) in sorted(refs):
                 robj = self.trace.table(rc).objects.get(ro)
                 if robj is not None:
-                    s += self._score_local(self.model.classes[rc], rc, robj)
+                    c = self._score_local(self.model.classes[rc], rc, robj)
+                    s += c
+                    if c:
+                        ev.append((rc, ro, c))
             scores.append(s)
+            evidence.append(ev)
         self.scored += len(settings)
         obj.values.update(old)
 
         marginal = logsumexp(scores)
         if marginal == -math.inf:
             return 0
-        chosen, _ = settings[_sample(scores, marginal)]
+        ci = _sample(scores, marginal)
+        chosen, _ = settings[ci]
 
         # Keep the CRP's counts honest. `ref_count` is the n_r that drives rich-get-richer
         # weighting in structure_prior.py, so a slot that moves without decrementing its
@@ -367,9 +389,22 @@ class Rejuvenator:
                 tbl.objects[before].ref_count -= 1
             if after is not None and after in tbl.objects:
                 tbl.objects[after].ref_count += 1
+            self.referrers.get((tname, before), set()).discard((cname, obj.oid))
+            self.referrers.setdefault((tname, after), set()).add((cname, obj.oid))
 
         obj.values.update(chosen)
         n = sum(1 for v in targets if chosen.get(v) != old.get(v))
+        if self.log is not None:
+            names = [cls.node_name(v) for v in targets]
+            self.log.append({
+                "cls": cname, "oid": obj.oid, "targets": names,
+                "old": {cls.node_name(v): old.get(v) for v in targets},
+                "settings": [{"values": {cls.node_name(v): vals.get(v) for v in targets},
+                              "prior": lp, "score": sc, "evidence": ev}
+                             for (vals, lp), sc, ev in zip(settings, scores, evidence)],
+                "chosen": ci,
+                "changed": n,
+            })
         if verbose and n:
             for v in targets:
                 if chosen.get(v) != old.get(v):

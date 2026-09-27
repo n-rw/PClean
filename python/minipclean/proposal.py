@@ -70,6 +70,43 @@ class FlatProposer:
         # How many candidate settings we scored. This is the quantity subproblem hints
         # exist to reduce, so it is worth being able to read it off directly.
         self.scored = 0
+        # Optional decision log, for the visualizer (../viz). None means off. When it is a
+        # list, every choice the walk commits to is appended as a dict, in order, with the
+        # candidates it weighed. Enumeration explores hypothetical branches, so each
+        # candidate's nested choices are logged into a scratch list and only the *chosen*
+        # branch's are kept. Logging never touches the RNG, so a logged run and an
+        # unlogged run with the same seed make identical choices.
+        self.log: Optional[list] = None
+
+    # ------------------------------------------------------------------ logging
+
+    def _log(self, entry: dict) -> None:
+        if self.log is not None:
+            self.log.append(entry)
+
+    def _logged_walk(self, cls, plan, obs, assignment, branches):
+        """`_walk`, capturing the nested choices it makes into `branches`."""
+        parent = self.log
+        if parent is not None:
+            self.log = []
+        try:
+            return self._walk(cls, plan, obs, assignment)
+        finally:
+            if parent is not None:
+                branches.append(self.log)
+                self.log = parent
+
+    def _log_choice(self, kind, cls, v, vals, priors, scores, chosen, branches):
+        if self.log is None:
+            return
+        self.log.append({
+            "kind": kind, "vertex": cls.node_name(v),
+            "candidates": [{"value": val, "prior": p, "score": s}
+                           for val, p, s in zip(vals, priors, scores)],
+            "chosen": chosen,
+        })
+        if chosen is not None and branches:
+            self.log.extend(branches[chosen])
 
     # ------------------------------------------------------------------ helpers
 
@@ -214,6 +251,8 @@ class FlatProposer:
                 # exists, so this attribute has no freedom. Bind and move on -- crucially,
                 # score nothing, because nothing was chosen.
                 assignment[v] = determined
+                self._log({"kind": "determined", "vertex": cls.node_name(v),
+                           "value": determined})
                 return self._walk(cls, step.rest, obs, assignment)
             # Otherwise the owning slot is creating a new object, so fall through and
             # enumerate this attribute for real (Algorithm 1, second branch).
@@ -233,19 +272,21 @@ class FlatProposer:
         if observed is not None:
             assignment[v] = observed
             lp = inner.dist.logdensity(observed, *args)
+            self._log({"kind": "observed", "vertex": cls.node_name(v),
+                       "value": observed, "logp": lp, "args": list(args)})
             m, q = self._walk(cls, step.rest, obs, assignment)
             return lp + m, q
 
         if inner.dist.has_discrete_proposal():
             options, priors = inner.dist.discrete_proposal(*args)
-            scores, vals, subs, qs = [], [], [], []
+            scores, vals, subs, qs, branches = [], [], [], [], []
             for opt, lp in zip(options, priors):
                 self.scored += 1
                 if opt is DUMMY:
                     opt = inner.dist.discrete_proposal_dummy_value(*args)
                 assignment[v] = opt
                 scratch = dict(assignment)
-                m, q = self._walk(cls, step.rest, obs, scratch)
+                m, q = self._logged_walk(cls, step.rest, obs, scratch, branches)
                 scores.append(lp + m)
                 vals.append(opt)
                 subs.append(scratch)
@@ -253,8 +294,10 @@ class FlatProposer:
             marginal = logsumexp(scores)
             if marginal == -math.inf:
                 assignment[v] = vals[0]
+                self._log_choice("attribute", cls, v, vals, priors, scores, None, None)
                 return -math.inf, 0.0
             i = _sample(scores, marginal)
+            self._log_choice("attribute", cls, v, vals, priors, scores, i, branches)
             assignment.clear()
             assignment.update(subs[i])
             assignment[v] = vals[i]
@@ -264,6 +307,8 @@ class FlatProposer:
         val = inner.dist.random(*args)
         assignment[v] = val
         lp = inner.dist.logdensity(val, *args)
+        self._log({"kind": "sampled", "vertex": cls.node_name(v), "value": val,
+                   "logp": lp})
         m, q = self._walk(cls, step.rest, obs, assignment)
         return lp + m, q + lp
 
@@ -284,6 +329,9 @@ class FlatProposer:
         key = self._hash_key(cls, v, target_cls, obs)
         if key is not None:
             hit = table.lookup(key)
+            self._log({"kind": "key_lookup", "vertex": cls.node_name(v),
+                       "target": fk.target_class, "key": list(key),
+                       "hit": hit.oid if hit is not None else None})
             if hit is not None:
                 assignment[v] = hit.oid
                 m, q = self._walk(cls, step.rest, obs, assignment)
@@ -293,12 +341,12 @@ class FlatProposer:
             return m, q
 
         oids, logw = crp_candidate_log_weights(table, target_cls.py, list(table.objects))
-        scores, cands, subs, qs = [], [], [], []
+        scores, cands, subs, qs, branches = [], [], [], [], []
         for oid, lw in zip(oids, logw):
             self.scored += 1
             assignment[v] = NewObject(v) if oid is None else oid
             scratch = dict(assignment)
-            m, q = self._walk(cls, step.rest, obs, scratch)
+            m, q = self._logged_walk(cls, step.rest, obs, scratch, branches)
             scores.append(lw + m)
             cands.append(assignment[v])
             subs.append(scratch)
@@ -307,8 +355,10 @@ class FlatProposer:
         marginal = logsumexp(scores)
         if marginal == -math.inf:
             assignment[v] = cands[-1]
+            self._log_choice("slot", cls, v, cands, logw, scores, None, None)
             return -math.inf, 0.0
         i = _sample(scores, marginal)
+        self._log_choice("slot", cls, v, cands, logw, scores, i, branches)
         assignment.clear()
         assignment.update(subs[i])
         assignment[v] = cands[i]
@@ -346,6 +396,18 @@ class FlatProposer:
         for v in slots:
             val = assignment.get(v)
             if not isinstance(val, NewObject):
+                # A flattened slot is a *new reference* only if the object that owns it
+                # is being created by this row. `practice.city` on a row whose Practice
+                # already exists is a read-only copy of that Practice's slot, not another
+                # arrow into the City -- count it and the CRP's n_r counts rows instead of
+                # referring objects, which is bug 2 of the README (per row vs per object)
+                # reappearing in the structure prior: every row of a big practice makes
+                # its city look more popular.
+                name = cls.node_name(v)
+                if "." in name:
+                    owner = cls.names[name.rsplit(".", 1)[0]]
+                    if not isinstance(assignment.get(owner), NewObject):
+                        continue
                 if val is not None:
                     obj = self.trace.table(
                         strip_submodel(cls.nodes[v]).target_class).objects.get(val)

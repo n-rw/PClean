@@ -59,6 +59,8 @@ vertices in one topological order and get enumerated together.
 | `example_physicians.py` | `experiments/physicians/run.jl` | Learned parameters on real CMS data |
 | `example_subproblems.py` | Figure 6's comparison | Subproblem hints measured: cost vs accuracy |
 | `example_gc.py` | the GC half-sentence in `[§3.1]` | Garbage collection, and why it is not housekeeping |
+| `particles.py` | the sequential form of `[§3.1]`, Fig. 5 | Multi-particle SMC over whole databases: reweighting, ESS, resampling |
+| `viz_record.py` | *(none)* | Records a run as a step-by-step event log for the visualizer in `../viz` |
 
 ## On the missing `@model` macro
 
@@ -84,6 +86,15 @@ python3 python/example_physicians.py --rows 3000  # learned parameters, real CMS
 python3 python/example_subproblems.py             # subproblem hints, measured
 python3 python/example_gc.py                      # garbage collection and the prior's support
 ```
+
+To *watch* the algorithm instead, step through a run in the browser:
+
+```
+python3 python/viz_record.py         # record the event logs (already committed)
+cd viz && npm install && npm run dev # http://localhost:5178
+```
+
+See [../viz/README.md](../viz/README.md).
 
 No dependencies beyond the standard library. The physicians example needs the CMS file;
 see [../PHYSICIANS-DATA.md](../PHYSICIANS-DATA.md).
@@ -174,9 +185,9 @@ The reconstructed dataset is byte-for-byte identical throughout — every accura
 looks the same — while the prior has moved 45%. That is the failure mode: not a leak, a
 silent bias on every entity-resolution decision that follows.
 
-## Five bugs worth knowing about
+## Seven bugs worth knowing about
 
-All four were live in this code. Each is one of the paper's ideas showing up in negative,
+All of them were live in this code. Each is one of the paper's ideas showing up in negative,
 so each is documented where it happened rather than quietly fixed.
 
 1. **Choosing a reference slot before scoring its dependents.** Picked blind, the slot
@@ -203,6 +214,25 @@ so each is documented where it happened rather than quietly fixed.
    candidates against a stale value, every candidate scores identically, and the prior
    decides — which looks exactly like inference working. One source of truth: an
    attribute lives on the object that owns it. See `proposal._determined`.
+
+6. **Counting a flattened slot as a new reference.** A row whose Practice already
+   exists still carries `practice.city` in its flattened graph, and `_materialize` used to
+   bump that City's `ref_count` for it. So the CRP's `n_r` counted *rows* rather than
+   referring *objects*: a practice with 152 rows made its city look 152 times as popular.
+   That is number 2 again, this time in the structure prior rather than the likelihood --
+   and invisible in the repair scores, because a hash key pins the practice anyway. It
+   showed up in the visualizer as a City reading `n_r = 5` with two practices pointing
+   at it. A flattened slot is a new reference only when the object owning it is being
+   created by this row. See `proposal._materialize`.
+
+7. **A referrer map built once.** `Rejuvenator` reads a City's evidence through the
+   objects that point at it, but built that map at construction and never updated it. After
+   the first slot move a City was scored against practices that had left it and ignored
+   ones that had joined. It is now updated on every move and rebuilt after garbage
+   collection. See `smc.Rejuvenator._build_referrers`.
+
+All five examples reproduce their documented numbers with 6 and 7 fixed; both
+bite hardest on datasets with many rows per entity and on repeated sweeps.
 
 Number 2 is the whole paper in miniature. The data is identical either way; only the
 counting differs, and the counting follows from where the error model sits in the schema.
